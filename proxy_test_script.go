@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,7 +19,7 @@ import (
 
 var logger = log.New(os.Stderr, "", 0)
 
-var AUTH *proxy.Auth = nil
+var AUTH *proxy.Auth = &proxy.Auth{}
 var TESTURL string = "https://httpbin.org/ip"
 var PORTOVERIDE string = ""
 
@@ -34,49 +35,72 @@ type Config struct {
 
 // file format : lines of ([^,]*)($VALIDHOSTNAME:$PORT)
 func main() {
+	var config Config
+	authuserPtr := flag.String("user", "", "override Auth username")
+	authpassPtr := flag.String("pass", "", "override Auth password")
+	urlPtr := flag.String("url", "", "URL to HTTP GET check proxy connection.")
+	portPtr := flag.String("port", "", "override Proxy port")
 	configPtr := flag.String("config", "", "json config file")
 	flag.Parse()
+
 	if len(*configPtr) > 0 {
 		jsonFile, err := os.Open(*configPtr)
 		if err != nil {
-			logger.Println("Failed to open config file.")
-			os.Exit(1)
+			logger.Fatalf("Error opening config file \"%s\": %v\n", *configPtr, err)
 		}
 		defer jsonFile.Close()
-		var config Config
+
 		body, _ := ioutil.ReadAll(jsonFile)
 		err = json.Unmarshal(body, &config)
 		if err != nil {
-			fmt.Printf("err was %v", err)
+			logger.Fatalf("Error parsing config file \"%s\": %v\n", *configPtr, err)
 		}
-		if len(config.User) > 0 || len(config.Password) > 0 {
-			AUTH = &proxy.Auth{User: config.User, Password: config.Password}
-		}
-		if len(config.PortOveride) > 0 {
-			PORTOVERIDE = config.PortOveride
-		}
-		if len(config.TestUrl) > 0 {
-			TESTURL = config.TestUrl
-		}
+	}
+
+	// Tedious flag/config overriding.
+	// TODO use viper
+
+	if len(config.User) > 0 {
+		AUTH.User = config.User
+	}
+	if len(*authuserPtr) > 0 {
+		AUTH.User = *authuserPtr
+	}
+	if len(config.Password) > 0 {
+		AUTH.Password = config.Password
+	}
+	if len(*authpassPtr) > 0 {
+		AUTH.Password = *authpassPtr
+	}
+
+	if len(config.PortOveride) > 0 {
+		PORTOVERIDE = config.PortOveride
+	}
+	if len(*portPtr) > 0 {
+		PORTOVERIDE = *portPtr
+	}
+
+	if len(config.TestUrl) > 0 {
+		TESTURL = config.TestUrl
+	}
+	if len(*urlPtr) > 0 {
+		TESTURL = *urlPtr
 	}
 
 	var file io.Reader
 	if len(flag.Args()) < 1 {
-		logger.Println("No input file name supplied.")
-		// file = os.Stdin
-		os.Exit(1)
+		logger.Fatalln("No filename for proxy list supplied.")
 	} else {
 		var err error
-		file, err = os.Open(flag.Args()[0])
+		filename := flag.Args()[0]
+		file, err = os.Open(filename)
 		if err != nil {
-			logger.Println("Failed to open input file.")
-			os.Exit(1)
+			logger.Fatalf("Failed to open input file \"%s\".", filename)
 		}
 
 	}
 
-	proxies := parse_input(file)
-	// logger.Print(proxies)
+	proxies := parseFile(file)
 	proccessProxies(proxies)
 }
 
@@ -86,17 +110,21 @@ func proccessProxies(proxies []string) {
 	if lenproxies < batchsize {
 		batchsize = lenproxies
 	}
-	//do_request(remote, TESTURL)
 	tcount := 0
 	fincount := 0
 	taskchan := make(chan int)
 
 	mytask := func(proxy string, tnum int) {
 		// logger.Printf("Task %d started.", tnum)
-		do_request(proxy, TESTURL)
+		body, err := makeRequest(proxy, TESTURL)
+		if err != nil {
+			logger.Printf("Failure for '%s': %v\n\n", proxy, err)
+		} else {
+			fmt.Printf("Success for '%s' :\n%s\n", proxy, body)
+		}
 		taskchan <- tnum
 	}
-	// spinup initial tasks
+	// spin up initial tasks
 	for ; tcount < batchsize; tcount++ {
 		go mytask(proxies[tcount], tcount)
 	}
@@ -115,41 +143,56 @@ func proccessProxies(proxies []string) {
 	close(taskchan)
 }
 
-func parse_input(file io.Reader) (output []string) {
+func parseFile(file io.Reader) (output []string) {
 	scanner := bufio.NewScanner(bufio.NewReader(file))
 	scanner.Split(bufio.ScanLines)
-
 	for i := 0; scanner.Scan(); i++ {
-		values := strings.Split(scanner.Text(), ",")
-		if len(values) < 2 {
-			logger.Printf("Warning, parsing line %d.\n", i)
-			continue
-		}
-		adds_str := values[1]
-		addresses := strings.Split(adds_str, "|")
-		if len(addresses) < 1 {
-			logger.Printf("Warning, invalid addresses on line %d.\n", i)
-		}
-		for _, remote := range addresses {
-			if len(PORTOVERIDE) > 0 {
-				pair := strings.Split(remote, ":")
-				if len(pair) == 2 {
-					remote = fmt.Sprintf("%s:%s", pair[0], PORTOVERIDE)
-					output = append(output, remote)
-				}
-			}
+		address, err := parseLine(scanner.Text())
+		if err != nil {
+			logger.Printf("Warning, Parsing line %d: %v", i, err)
+		} else {
+			output = append(output, address)
 		}
 	}
 	return output
 }
 
-func do_request(address, testUrl string) bool {
+func parseLine(line string) (string, error) {
+	values := strings.Split(line, ",")
+	if len(values) < 2 {
+		return "", errors.New("Parse error. Not enough values to unpack.")
+	}
+	adds_str := values[1]
+	addresses := strings.Split(adds_str, "|")
+
+	if len(addresses) < 1 {
+		return "", errors.New("Parse error. Invalid addresses.")
+	}
+	firatAdd := addresses[0]
+
+	if len(firatAdd) < 1 {
+		return "", errors.New("Parse error. Invalid address.")
+	}
+
+	pair := strings.Split(firatAdd, ":")
+	if len(pair) != 2 {
+		return "", errors.New("Parse error. Invalid 'address:port' format.")
+	}
+
+	host, port := pair[0], pair[1]
+	if len(PORTOVERIDE) > 0 {
+		port = PORTOVERIDE
+	}
+
+	return fmt.Sprintf("%s:%s", host, port), nil
+}
+
+func makeRequest(address, testUrl string) (string, error) {
 
 	// create a socks5 dialer
 	dialer, err := proxy.SOCKS5("tcp", address, AUTH, proxy.Direct)
 	if err != nil {
-		logger.Println("Error, proxy setup:", err)
-		return false
+		return "", errors.New(fmt.Sprint("Proxy setup failed:", err))
 	}
 	// setup a http client
 	httpTransport := &http.Transport{}
@@ -160,21 +203,18 @@ func do_request(address, testUrl string) bool {
 	// create a request
 	req, err := http.NewRequest("GET", testUrl, nil)
 	if err != nil {
-		logger.Println("Error, request setup:", err)
-		return false
+		return "", errors.New(fmt.Sprint("Request setup failed:", err))
 	}
 	// use the http client to fetch the page
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		logger.Println("Error, request failed:", err)
-		return false
+		return "", errors.New(fmt.Sprint("Request failed:", err))
 	}
 	defer resp.Body.Close()
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error, reponse terminated:", err)
-		return false
+		return "", errors.New(fmt.Sprintf("Reponse terminated early: %v", err))
 	}
-	fmt.Println(string(b))
-	return true
+
+	return string(b), nil
 }
