@@ -25,6 +25,9 @@ type HostEntry struct {
 func main() {
 	filePtr := flag.String("file", "", "file")
 	flag.Parse()
+	if len*(filePtr) < 1 {
+		logger.Fatal("No \"-file\" parameter provided.")
+	}
 
 	hosts, err := openAndParseFile(*filePtr)
 	if err != nil {
